@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""VII-Composite (DWD, ODIM-HDF5) -> farbiges Hagelrisiko-WebP in EPSG:3857."""
+"""VII-Composite (DWD, ODIM-HDF5) -> Hagelrisiko im NATIVEN DWD-Raster.
+
+Kein Warp nach Web Mercator, keine Einfaerbung. Ausgabe: rohe uint8-Bytes,
+keine Dateiendung.
+Layout: ysize Zeilen x xsize Spalten, row-major, Zeile 0 = Norden (wie im HDF5).
+Dateigroesse immer exakt xsize * ysize Bytes.
+
+Code-Bedeutung in der Ausgabedatei:
+    0       = kein Hagelrisiko (unter MIN_VISIBLE) -> transparent
+    1..N    = Stufe i (1-basiert) aus HAIL_TABLE; Farbe/Schwelle siehe Client-Metadaten
+    255     = kein Daten / ausserhalb
+"""
+import json
 import re
 import sys
 from datetime import datetime, timezone
@@ -8,7 +20,6 @@ from zoneinfo import ZoneInfo
 
 import h5py
 import numpy as np
-from PIL import Image
 from pyproj import Transformer
 
 # --------------------------------------------------------------------------- #
@@ -27,11 +38,14 @@ DEFAULT_GAIN = 1.0
 DEFAULT_OFFSET = 0.0
 DEFAULT_NODATA = 65535
 
-# Darunter: transparent
+# Darunter: Code 0 (transparent)
 MIN_VISIBLE = 0.005
 
-# Jeder Wert bekommt die Farbe der letzten Schwelle <= Wert.
+NODATA_BYTE = 255
+
+# Jeder Wert bekommt die Stufe der letzten Schwelle <= Wert.
 # (Schwelle, Hex-Farbe) - Einheit = Einheit des Datasets nach gain/offset
+# Die Farben werden nur noch fuer die Client-Metadaten gebraucht.
 HAIL_TABLE: list[tuple[float, str]] = [
     #GRAU
     (0.005,  "#B1B1B1"),
@@ -75,35 +89,12 @@ HAIL_TABLE: list[tuple[float, str]] = [
     (70,     "#FFC8FF")
 ]
 
-
-def _hex_to_rgb(h: str) -> tuple[int, int, int]:
-    h = h.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-
-# Geometrie / Ausgabe
 BERLIN = ZoneInfo("Europe/Berlin")
-WEBMERCATOR_OUT_WIDTH = 1927
-EDGE_SAMPLES = 200
-BBOX_MARGIN_DEG = 0.02
-EARTH_RADIUS = 6378137.0
 
 
 # --------------------------------------------------------------------------- #
 # Hilfsfunktionen
 # --------------------------------------------------------------------------- #
-def lonlat_to_webmercator(lon_deg, lat_deg):
-    x = EARTH_RADIUS * np.radians(lon_deg)
-    y = EARTH_RADIUS * np.log(np.tan(np.pi / 4 + np.radians(lat_deg) / 2))
-    return x, y
-
-
-def webmercator_to_lonlat(x, y):
-    lon = np.degrees(x / EARTH_RADIUS)
-    lat = np.degrees(2 * np.arctan(np.exp(y / EARTH_RADIUS)) - np.pi / 2)
-    return lon, lat
-
-
 def parse_filename(filename: str) -> tuple[datetime, int]:
     """Liefert (Basiszeit UTC, Vorhersageschritt in Minuten; 0 falls keiner)."""
     m = FILENAME_RE.match(filename)
@@ -204,14 +195,13 @@ def read_metadata(h5file: h5py.File, ds: h5py.Dataset) -> dict:
     nominal = _parse_odim_time(first("date"), first("time")) \
         if first("date") is not None else None
 
-    meta = {
+    return {
         "product": _attr_str(first("product")) if first("product") is not None else None,
         "quantity": _attr_str(first("quantity")) if first("quantity") is not None else None,
         "nominal_time": nominal,
         "start": start,
         "end": end,
     }
-    return meta
 
 
 def find_where_group(h5file: h5py.File) -> h5py.Group | None:
@@ -253,76 +243,21 @@ def extract_grid_info(where: h5py.Group) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Geometrie / Warp
+# Kodieren (statt Einfaerben)
 # --------------------------------------------------------------------------- #
-def native_origin_and_extent(grid: dict, to_proj: Transformer):
-    ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
-    x_max = ll_x + grid["xsize"] * grid["xscale"]
-    y_max = ll_y + grid["ysize"] * grid["yscale"]
-    return ll_x, ll_y, x_max, y_max
-
-
-def wgs84_bbox_from_perimeter(ll_x, ll_y, x_max, y_max, to_wgs84: Transformer):
-    t = np.linspace(0.0, 1.0, EDGE_SAMPLES)
-    xs_span = ll_x + t * (x_max - ll_x)
-    ys_span = ll_y + t * (y_max - ll_y)
-    xs = np.concatenate([xs_span, xs_span, np.full_like(ys_span, ll_x), np.full_like(ys_span, x_max)])
-    ys = np.concatenate([np.full_like(xs_span, ll_y), np.full_like(xs_span, y_max), ys_span, ys_span])
-    lons, lats = (np.asarray(a) for a in to_wgs84.transform(xs, ys))
-    return (
-        float(lons.min()) - BBOX_MARGIN_DEG,
-        float(lons.max()) + BBOX_MARGIN_DEG,
-        float(lats.min()) - BBOX_MARGIN_DEG,
-        float(lats.max()) + BBOX_MARGIN_DEG,
-    )
-
-
-def webmercator_target_grid(lon_min, lon_max, lat_min, lat_max):
-    x_min, y_min = lonlat_to_webmercator(lon_min, lat_min)
-    x_max, y_max = lonlat_to_webmercator(lon_max, lat_max)
-    aspect = (y_max - y_min) / (x_max - x_min)
-    out_h = max(int(round(WEBMERCATOR_OUT_WIDTH * aspect)), 1)
-    x_new = np.linspace(x_min, x_max, WEBMERCATOR_OUT_WIDTH)
-    y_new = np.linspace(y_min, y_max, out_h)
-    return x_new, y_new, [x_min, y_min, x_max, y_max]
-
-
-def nearest_neighbor_warp(data, grid, to_proj, x_new, y_new, fill_value=np.nan):
-    xx, yy = np.meshgrid(x_new, y_new)
-    lon, lat = webmercator_to_lonlat(xx, yy)
-    x_nat, y_nat = to_proj.transform(lon.ravel(), lat.ravel())
-    x_nat = np.asarray(x_nat).reshape(xx.shape)
-    y_nat = np.asarray(y_nat).reshape(xx.shape)
-
-    ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
-
-    col = np.floor((x_nat - ll_x) / grid["xscale"]).astype(np.int64)
-    row = (grid["ysize"] - 1 - np.floor((y_nat - ll_y) / grid["yscale"])).astype(np.int64)
-    valid = (col >= 0) & (col < grid["xsize"]) & (row >= 0) & (row < grid["ysize"])
-
-    out = np.full(xx.shape, fill_value, dtype=np.float64)
-    out[valid] = data[row[valid], col[valid]]
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# Einfaerben
-# --------------------------------------------------------------------------- #
-def colorize(values: np.ndarray) -> np.ndarray:
-    """Wert -> RGBA mit diskreten Hagelrisiko-Farbstufen."""
+def encode_levels(values: np.ndarray) -> np.ndarray:
+    """Wert -> uint8-Code (0 = nichts, 1..N = Stufe, 255 = nodata)."""
     thresholds = np.array([t for t, _ in HAIL_TABLE], dtype=np.float64)
-    colors = np.array([_hex_to_rgb(c) for _, c in HAIL_TABLE], dtype=np.uint8)
 
-    rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
+    codes = np.zeros(values.shape, dtype=np.uint8)
+    codes[~np.isfinite(values)] = NODATA_BYTE
+
     visible = np.isfinite(values) & (values >= max(MIN_VISIBLE, thresholds[0]))
-    if not visible.any():
-        return rgba
-
-    idx = np.searchsorted(thresholds - 1e-6, values[visible], side="right") - 1
-    idx = np.clip(idx, 0, len(thresholds) - 1)
-    rgba[visible, :3] = colors[idx]
-    rgba[visible, 3] = 255
-    return rgba
+    if visible.any():
+        idx = np.searchsorted(thresholds - 1e-6, values[visible], side="right") - 1
+        idx = np.clip(idx, 0, len(thresholds) - 1)
+        codes[visible] = idx + 1  # 1-basiert, 0 bleibt "nichts"
+    return codes
 
 
 # --------------------------------------------------------------------------- #
@@ -345,7 +280,7 @@ def main() -> None:
         meta = read_metadata(f, ds)
         where = find_where_group(f)
         if where is None:
-            sys.exit("Keine 'where'-Projektionsinfo in der HD5-Datei gefunden - Warp nicht möglich.")
+            sys.exit("Keine 'where'-Projektionsinfo in der HD5-Datei gefunden.")
         grid = extract_grid_info(where)
 
     # Fallback: Zeiten aus Dateiname, falls nicht in der Datei
@@ -364,29 +299,40 @@ def main() -> None:
         f"{meta['end'].astimezone(BERLIN):%H:%M} Berlin)"
     )
 
-    if values_native.shape != (grid["ysize"], grid["xsize"]):
+    h, w = values_native.shape
+    if (h, w) != (grid["ysize"], grid["xsize"]):
         sys.exit(f"Rastergröße {values_native.shape} passt nicht zu where-Info "
                  f"({grid['ysize']} x {grid['xsize']}).")
+    print(f"Natives Raster: {w} x {h} px, {grid['xscale']} m / px")
 
-    to_proj = Transformer.from_crs("EPSG:4326", grid["projdef"], always_xy=True)
-    to_wgs84 = Transformer.from_crs(grid["projdef"], "EPSG:4326", always_xy=True)
+    codes = encode_levels(values_native)
 
-    ll_x, ll_y, x_max, y_max = native_origin_and_extent(grid, to_proj)
-    lon_min, lon_max, lat_min, lat_max = wgs84_bbox_from_perimeter(ll_x, ll_y, x_max, y_max, to_wgs84)
-    x_new, y_new, extent = webmercator_target_grid(lon_min, lon_max, lat_min, lat_max)
-    print(f"WGS84-BBox: lon [{lon_min:.4f}, {lon_max:.4f}], lat [{lat_min:.4f}, {lat_max:.4f}]")
-    print(f"EPSG:3857-Extent [xmin, ymin, xmax, ymax]: {extent}")
-    print(f"Zielraster: {len(x_new)} x {len(y_new)} px")
-
-    merc = nearest_neighbor_warp(values_native, grid, to_proj, x_new, y_new)
-    rgba = colorize(merc)
-
+    # Speichern: rohe Bytes, keine Dateiendung, Zeile 0 = Norden
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    stem = f"vii_{ts.astimezone(BERLIN):%Y%m%d_%H%M}"
-    out_path = OUT_DIR / f"{stem}.webp"
-    # y_new laeuft von Sued nach Nord, Bilder von oben nach unten
-    Image.fromarray(rgba[::-1], mode="RGBA").save(out_path, format="WEBP", lossless=True)
-    print(f"Gespeichert: {out_path}")
+    out_path = OUT_DIR / f"vii_{ts.astimezone(BERLIN):%Y%m%d_%H%M}"
+    np.ascontiguousarray(codes).tofile(out_path)
+    print(f"Gespeichert: {out_path} ({w}x{h}, {codes.nbytes} Bytes)")
+
+    # Metadaten fuer den Client (aendern sich nicht -> einmalig kopieren)
+    to_proj = Transformer.from_crs("EPSG:4326", grid["projdef"], always_xy=True)
+    ll_x, ll_y = to_proj.transform(grid["ll_lon"], grid["ll_lat"])
+    client_meta = {
+        "width": w,
+        "height": h,
+        "projdef": grid["projdef"],
+        "xscale": grid["xscale"],
+        "yscale": grid["yscale"],
+        "ll_x": ll_x,
+        "ll_y": ll_y,
+        "rowOrder": "north-to-south",
+        "nodataCode": NODATA_BYTE,
+        "emptyCode": 0,
+        "levels": [
+            {"code": i + 1, "min": t, "color": c}
+            for i, (t, c) in enumerate(HAIL_TABLE)
+        ],
+    }
+    print("Client-Metadaten:", json.dumps(client_meta))
 
 
 if __name__ == "__main__":
